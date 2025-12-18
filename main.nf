@@ -52,6 +52,7 @@ workflow {
     def chroms = parseChroms(params.chroms)
     def plink_ready
     def plink_pca
+    def method = (params.method ?: "admixture").toString().toLowerCase()
 
     // 1. Download Panel and Create Sample Lists
     DOWNLOAD_PANEL()
@@ -120,7 +121,7 @@ workflow {
     plink_ready = plink_all
     plink_pca = plink_all
 
-    if (params.method == "structure") {
+    if (method == "structure") {
         CONVERT_TO_STRUCTURE_ALL(plink_pca, ref_lists_separate)
         RUN_STRUCTURE_ALL(CONVERT_TO_STRUCTURE_ALL.out)
         SUMMARIZE_STRUCTURE_ALL(RUN_STRUCTURE_ALL.out, ref_lists_separate)
@@ -129,7 +130,7 @@ workflow {
             .collect()
             .set { structure_ancestry_files }
 
-        PLOT_ANCESTRY(structure_ancestry_files, ref_lists_separate)
+        PLOT_ANCESTRY(method, structure_ancestry_files, ref_lists_separate)
     } else {
         RUN_ADMIXTURE(plink_ready)
         .set { admixture_outputs }
@@ -139,7 +140,7 @@ workflow {
         .collect()
         .set { all_tsvs }
         
-        PLOT_ANCESTRY(all_tsvs, ref_lists_separate)
+        PLOT_ANCESTRY(method, all_tsvs, ref_lists_separate)
     }
     
     RUN_PCA_ALL(plink_pca)
@@ -358,10 +359,11 @@ PY
 }
 
 process PLOT_ANCESTRY {
-    publishDir "${params.outdir}/plots", mode: 'copy'
+    publishDir { "${params.outdir}/plots/${method ? method.toString().toLowerCase() : 'admixture'}" }, mode: 'copy'
     conda 'environment.yml'
 
     input:
+    val method
     path ancestry_files
     tuple path(mxl_list), path(eur_list), path(afr_list)
 
@@ -379,6 +381,8 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import sys
+
+method = "${method}".strip().lower() if "${method}" else "admixture"
 
 mxl_file = "${mxl_list}"
 eur_file = "${eur_list}"
@@ -430,7 +434,7 @@ width = max(10, min(200, len(plot_df)*0.2))
 
 ax = plot_df.plot(kind='bar', stacked=True, figsize=(width, 6), width=1.0)
 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.title("Ancestry Admixture (Samples Only)")
+plt.title(f"Ancestry {method.upper()} (Samples Only)")
 plt.xlabel("Sample")
 plt.ylabel("Proportion")
 plt.tight_layout()
@@ -541,6 +545,7 @@ process SUMMARIZE_Q {
     python3 - <<'PY'
 import csv
 import sys
+import itertools
 
 qfile = "${qfile}"
 famfile = "${fam}"
@@ -558,6 +563,7 @@ ref_groups = {
     "EUR": read_ids(eur_file),
     "AFR": read_ids(afr_file),
 }
+expected_pops = ["MXL", "EUR", "AFR"]
 
 # Read Q file
 q_rows = []
@@ -604,37 +610,35 @@ for pop in ref_groups:
     if col_counts[pop] > 0:
         col_means[pop] = [x / col_counts[pop] for x in col_means[pop]]
     else:
-        print(f"Warning: No reference samples found for {pop} in FAM/Q", file=sys.stderr)
+        sys.exit(
+            f"No reference samples from {pop} found in ADMIXTURE FAM/Q. "
+            f"This usually means your 1KG IDs (from {pop.lower()}_40.samples) do not match the PLINK IID column."
+        )
 
-# Assign each population to the column where it has the highest average proportion
-# We sort populations by their max column value to assign the most distinct ones first
-pop_max_vals = []
-for pop in ref_groups:
-    if col_counts[pop] > 0:
-        means = col_means[pop]
-        max_val = max(means)
-        best_k = means.index(max_val)
-        pop_max_vals.append((max_val, pop, best_k))
+if num_k != len(expected_pops):
+    sys.exit(
+        f"ADMIXTURE K={num_k} but this workflow expects K=3 (MXL/EUR/AFR) for reference-anchored proportions. "
+        f"Run with --k 3."
+    )
 
-# Sort by max value descending to assign clear clusters first
-pop_max_vals.sort(key=lambda x: x[0], reverse=True)
+# Robust 1:1 mapping from ADMIXTURE columns -> (MXL, EUR, AFR)
+# We choose the assignment that maximizes reference-group mean Q.
+best_score = None
+best_assignment = None  # pop -> column index
+for perm in itertools.permutations(range(num_k), len(expected_pops)):
+    score = 0.0
+    for pop, col_idx in zip(expected_pops, perm):
+        score += col_means[pop][col_idx]
+    if best_score is None or score > best_score:
+        best_score = score
+        best_assignment = {pop: col_idx for pop, col_idx in zip(expected_pops, perm)}
 
-col_to_pop = {}
-for max_val, pop, k in pop_max_vals:
-    if k in col_to_pop:
-        print(f"Warning: Population {pop} maps to same column {k} as {col_to_pop[k]}", file=sys.stderr)
-        continue
-    col_to_pop[k] = pop
+if not best_assignment:
+    sys.exit("Failed to map ADMIXTURE columns to reference populations")
 
-# Generate labels
-labels = []
-for k in range(num_k):
-    if k in col_to_pop:
-        labels.append(col_to_pop[k])
-    else:
-        labels.append(f"K{k+1}")
+print(f"ADMIXTURE column mapping: {best_assignment}", file=sys.stderr)
 
-print(f"Inferred Labels: {labels}", file=sys.stderr)
+labels = expected_pops
 
 # Write output
 with open(outfile, 'w', newline='') as f:
@@ -642,7 +646,12 @@ with open(outfile, 'w', newline='') as f:
     header = ["IID"] + labels
     writer.writerow(header)
     for iid, q in zip(iids, q_rows):
-        writer.writerow([iid] + q)
+        q_reordered = [
+            q[best_assignment["MXL"]],
+            q[best_assignment["EUR"]],
+            q[best_assignment["AFR"]],
+        ]
+        writer.writerow([iid] + q_reordered)
 PY
     """
 }
@@ -679,7 +688,7 @@ afr_file = "${afr_list}"
 ref_groups = {}
 for pop, fpath in [("MXL", mxl_file), ("EUR", eur_file), ("AFR", afr_file)]:
     with open(fpath, 'r') as f:
-        ref_groups[pop] = [line.strip() for line in f if line.strip()]
+        ref_groups[pop] = set(line.strip() for line in f if line.strip())
 
 # Map to integers: MXL=1, EUR=2, AFR=3
 # POPFLAG: 1 for references, 0 for others
@@ -700,6 +709,22 @@ with open(famfile, 'r') as f:
     fam_lines = [l.strip().split() for l in f if l.strip()]
     # FAM: FID IID ...
     iids = [l[1] for l in fam_lines if len(l) >= 2]
+
+# Fail fast if reference IDs don't match PLINK IIDs
+counts = {pop: 0 for pop in ref_groups}
+for pop, samples in ref_groups.items():
+    counts[pop] = sum(1 for iid in iids if iid in samples)
+
+missing = [pop for pop, c in counts.items() if c == 0]
+if missing:
+    msg = [
+        "ERROR: No reference IIDs matched PLINK .fam for: " + ", ".join(missing),
+        "Counts (MXL/EUR/AFR): " + ", ".join(f"{p}={counts[p]}" for p in sorted(counts)),
+        "This usually means the 1KG panel IDs (mxl/eur/afr .samples) don't match the PLINK IID column created from your merged VCF.",
+        "Debug: first 10 IIDs in .fam: " + ", ".join(iids[:10]),
+    ]
+    sys.stderr.write("\\n".join(msg) + "\\n")
+    sys.exit(2)
 
 with open(infile, 'r') as fin, open(outfile, 'w') as fout:
     lines = fin.readlines()
@@ -783,7 +808,10 @@ process RUN_STRUCTURE_ALL {
 #define MARKOVPHASE 0
 EOF
 
-    touch extraparams
+    # Start chains anchored at the provided PopInfo (refs have POPFLAG=1, samples POPFLAG=0)
+    cat <<EOF > extraparams
+#define STARTATPOPINFO 1
+EOF
     
     ${params.structure}
     
@@ -809,6 +837,7 @@ process SUMMARIZE_STRUCTURE_ALL {
     python3 - <<'PY'
 import csv
 import sys
+import itertools
 
 sample_id = "${sample_id}"
 struct_file = "${struct_out}"
@@ -866,7 +895,36 @@ num_k = 3
 if 1 in pop_cluster_map:
     num_k = len(pop_cluster_map[1])
 
-# 2. Parse Individuals
+if num_k != 3:
+    sys.exit(f"Expected K=3 for supervised STRUCTURE (MXL/EUR/AFR), got K={num_k}")
+
+# Robust assignment: map clusters -> (MXL, EUR, AFR) by maximizing the 'Given Pop' table probabilities
+pop_ids = [1, 2, 3]
+expected_pops = ["MXL", "EUR", "AFR"]
+
+if not all(pid in pop_cluster_map for pid in pop_ids):
+    missing = [str(pid) for pid in pop_ids if pid not in pop_cluster_map]
+    sys.exit(
+        "Missing reference pop(s) in STRUCTURE 'Given Pop' table for PopID(s): " + ",".join(missing) + ". "
+        "This usually indicates refs were not recognized (ID mismatch) or USEPOPINFO did not engage."
+    )
+
+best_score = None
+best_cluster_for_pop = None  # pop_id -> cluster index
+for perm in itertools.permutations(range(num_k), len(pop_ids)):
+    score = 0.0
+    for pid, cluster_idx in zip(pop_ids, perm):
+        score += pop_cluster_map[pid][cluster_idx]
+    if best_score is None or score > best_score:
+        best_score = score
+        best_cluster_for_pop = {pid: cluster_idx for pid, cluster_idx in zip(pop_ids, perm)}
+
+if not best_cluster_for_pop:
+    sys.exit("Failed to map STRUCTURE clusters to reference populations")
+
+sys.stderr.write(f"STRUCTURE cluster mapping (PopID->cluster): {best_cluster_for_pop}\\n")
+
+# 2. Parse Individuals (use per-individual Q values for everyone)
 in_data = False
 for line in lines:
     if "Inferred ancestry of individuals:" in line:
@@ -890,47 +948,33 @@ for line in lines:
             pop_id = int(parts[colon_idx-1])
         except:
             continue
-            
-        if pop_id == 0:
-            # Target Sample: Read Q values directly
-            # After colon: Q1 Q2 Q3
-            # Be careful with parsing, sometimes there are extra spaces
-            q_part = parts[colon_idx+1:]
-            # Take first K values
+
+        q_part = parts[colon_idx+1:]
+        try:
             q_vals = [float(x) for x in q_part[:num_k]]
-            data[iid] = q_vals
-        else:
-            # Reference Sample: Use the table mapping
-            if pop_id in pop_cluster_map:
-                data[iid] = pop_cluster_map[pop_id]
-            else:
-                data[iid] = [0.0] * num_k
+        except:
+            continue
+        data[iid] = q_vals
 
-# Determine Labels
-cluster_pops = {} # K -> [Pops]
-for pid, probs in pop_cluster_map.items():
-    if pid == 0: continue
-    if not probs: continue
-    max_p = max(probs)
-    best_k = probs.index(max_p)
-    if max_p > 0.4: # Threshold
-        if best_k not in cluster_pops: cluster_pops[best_k] = []
-        pname = {1:"MXL", 2:"EUR", 3:"AFR"}.get(pid, "?")
-        cluster_pops[best_k].append(pname)
+final_labels = expected_pops
 
-final_labels = []
-for k in range(num_k):
-    if k in cluster_pops:
-        final_labels.append("-".join(cluster_pops[k]))
-    else:
-        final_labels.append(f"K{k+1}")
+cluster_for_label = {
+    "MXL": best_cluster_for_pop[1],
+    "EUR": best_cluster_for_pop[2],
+    "AFR": best_cluster_for_pop[3],
+}
 
 # Write Output
 with open(outfile, 'w', newline='') as f:
     writer = csv.writer(f, delimiter='\\t')
     writer.writerow(["IID"] + final_labels)
     for iid, q in data.items():
-        writer.writerow([iid] + q)
+        q_reordered = [
+            q[cluster_for_label["MXL"]],
+            q[cluster_for_label["EUR"]],
+            q[cluster_for_label["AFR"]],
+        ]
+        writer.writerow([iid] + q_reordered)
 PY
     """
 }
