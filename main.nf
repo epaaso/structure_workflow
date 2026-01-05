@@ -18,6 +18,11 @@ params.mind    = 0.8
 params.ld_window = 50
 params.ld_step   = 5
 params.ld_r2     = 0.2
+params.r2_sweep  = false
+params.r2_values = "0.01,0.02,0.05,0.1,0.2,0.3"
+params.r2_ld_window = "500"
+params.r2_ld_step   = 10
+params.r2_pca_components = 10
 params.seed      = 42
 params.panel_url = "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/integrated_call_samples_v3.20130502.ALL.panel"
 params.vcf_base_url = "https://hgdownload.soe.ucsc.edu/gbdb/hg38/1000Genomes"
@@ -26,7 +31,7 @@ params.plink     = "/home/epaaso/bin/plink"
 params.admixture = "admixture"
 params.structure = "${workflow.projectDir}/bin/structure"
 params.method    = "admixture" // "admixture" or "structure"
-params.max_cpus  = 16          // per-process max; overridden by --max_cpus
+params.max_cpus  = 18          // per-process max; overridden by --max_cpus
 params.max_memory = '120 GB'   // per-process max; overridden by --max_memory
 params.burnin    = 1000
 params.numreps   = 1000
@@ -46,6 +51,14 @@ def parseChroms(value) {
         }
     }
     return expanded.collect { "chr${it}" }
+}
+
+def parseR2List(value) {
+    if (value == null) {
+        return []
+    }
+    def tokens = value.toString().split(/[, ]+/).findAll { it }
+    return tokens.collect { it.trim() }.findAll { it }
 }
 
 workflow {
@@ -118,8 +131,31 @@ workflow {
     .set { merged_all }
     
     def plink_all = PREPARE_PLINK(merged_all)
-    plink_ready = plink_all
-    plink_pca = plink_all
+    plink_ready = plink_all.pruned
+    plink_pca = plink_all.pruned
+
+    if (params.r2_sweep) {
+        def r2_values = parseR2List(params.r2_values)
+        if (!r2_values) {
+            error "r2_sweep enabled but r2_values is empty; provide --r2_values \"0.01,0.02,...\""
+        }
+
+        plink_all.dedup
+            .flatMap { sample_id, bed, bim, fam ->
+                r2_values.collect { r2 -> tuple(sample_id, bed, bim, fam, r2) }
+            }
+            .set { r2_sweep_inputs }
+
+        def r2_sweep = LD_PRUNE_R2_SWEEP(r2_sweep_inputs)
+        def r2_pruned_sets = r2_sweep.pruned
+
+        RUN_PCA_R2(r2_pruned_sets)
+            .set { r2_pca_outputs }
+
+        PLOT_PCA_R2(r2_pca_outputs, ref_lists_separate)
+
+        RUN_ADMIXTURE_R2(r2_pruned_sets)
+    }
 
     if (method == "structure") {
         CONVERT_TO_STRUCTURE_ALL(plink_pca, ref_lists_separate)
@@ -246,7 +282,13 @@ process PREPARE_PLINK {
     tuple val(sample_id),
           path("${sample_id}_pruned.bed"),
           path("${sample_id}_pruned.bim"),
-          path("${sample_id}_pruned.fam")
+          path("${sample_id}_pruned.fam"),
+          emit: pruned
+    tuple val(sample_id),
+          path("${sample_id}_dedup.bed"),
+          path("${sample_id}_dedup.bim"),
+          path("${sample_id}_dedup.fam"),
+          emit: dedup
 
     script:
     """
@@ -264,6 +306,160 @@ process PREPARE_PLINK {
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_clean --set-all-var-ids @:# --rm-dup exclude-all --make-bed --out ${sample_id}_dedup
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_dedup --indep-pairwise ${params.ld_window} ${params.ld_step} ${params.ld_r2} --bad-ld --out ${sample_id}_prune
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_dedup --extract ${sample_id}_prune.prune.in --make-bed --out ${sample_id}_pruned
+    """
+}
+
+process LD_PRUNE_R2_SWEEP {
+    publishDir "${params.outdir}/r2_sweep/pruned", mode: 'copy'
+    tag { "${sample_id}_r2_${r2}" }
+    // No conda here to avoid path issues
+
+    input:
+    tuple val(sample_id), path(bed), path(bim), path(fam), val(r2)
+
+    output:
+    tuple val(sample_id), val(r2),
+          path("${sample_id}_r2_${r2}_pruned.bed"),
+          path("${sample_id}_r2_${r2}_pruned.bim"),
+          path("${sample_id}_r2_${r2}_pruned.fam"),
+          emit: pruned
+    tuple val(sample_id), val(r2),
+          path("${sample_id}_r2_${r2}_prune.prune.in"),
+          path("${sample_id}_r2_${r2}_prune.prune.out"),
+          emit: prune_lists
+
+    script:
+    """
+    set -euo pipefail
+    plink=${params.plink}
+    mem_mb=${task.memory.toMega()}
+
+    \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${bed.baseName} \\
+        --indep-pairwise ${params.r2_ld_window} ${params.r2_ld_step} ${r2} \\
+        --out ${sample_id}_r2_${r2}_prune
+
+    \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${bed.baseName} \\
+        --extract ${sample_id}_r2_${r2}_prune.prune.in --make-bed --out ${sample_id}_r2_${r2}_pruned
+    """
+}
+
+process RUN_PCA_R2 {
+    publishDir "${params.outdir}/r2_sweep/pca", mode: 'copy'
+    tag { "${sample_id}_r2_${r2}" }
+    // No conda here to avoid path issues
+
+    input:
+    tuple val(sample_id), val(r2), path(bed), path(bim), path(fam)
+
+    output:
+    tuple val(sample_id), val(r2),
+          path("pca_${sample_id}_r2_${r2}.eigenvec"),
+          path("pca_${sample_id}_r2_${r2}.eigenval")
+
+    script:
+    """
+    set -euo pipefail
+    mem_mb=${task.memory.toMega()}
+    # Use plink 1.9 for PCA
+    ${params.plink} --threads ${task.cpus} --memory \$mem_mb --bfile ${bed.baseName} \\
+        --pca ${params.r2_pca_components} header --out pca_${sample_id}_r2_${r2}
+    """
+}
+
+process PLOT_PCA_R2 {
+    publishDir "${params.outdir}/r2_sweep/plots", mode: 'copy'
+    conda 'environment.yml'
+
+    input:
+    tuple val(sample_id), val(r2), path(eigenvec), path(eigenval)
+    tuple path(mxl_list), path(eur_list), path(afr_list)
+
+    output:
+    path "pca_${sample_id}_r2_${r2}.png"
+
+    script:
+    """
+    python3 - <<'PY'
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sample_id = "${sample_id}"
+r2 = "${r2}"
+eigenvec = "${eigenvec}"
+mxl_file = "${mxl_list}"
+eur_file = "${eur_list}"
+afr_file = "${afr_list}"
+out_png = f"pca_{sample_id}_r2_{r2}.png"
+
+# Load reference samples
+ref_groups = {}
+for pop, fpath in [("MXL", mxl_file), ("EUR", eur_file), ("AFR", afr_file)]:
+    with open(fpath, 'r') as f:
+        ref_groups[pop] = set(line.strip() for line in f if line.strip())
+
+# Read eigenvec
+try:
+    df = pd.read_csv(eigenvec, delim_whitespace=True)
+except:
+    df = pd.read_csv(eigenvec, sep='\\t')
+
+# Rename columns if needed
+col_map = {c: c.replace('#', '') for c in df.columns}
+df.rename(columns=col_map, inplace=True)
+
+# Ensure we have IID
+if 'IID' not in df.columns:
+    if len(df.columns) >= 3:
+        df.rename(columns={df.columns[0]: 'IID'}, inplace=True)
+
+def get_pop(iid):
+    for pop, samples in ref_groups.items():
+        if iid in samples:
+            return pop
+    return "Sample"
+
+df['Population'] = df['IID'].apply(get_pop)
+
+# Plot
+plt.figure(figsize=(12, 10))
+sns.scatterplot(data=df, x='PC1', y='PC2', hue='Population', style='Population', s=100)
+
+# Add labels for samples
+for _, row in df.iterrows():
+    if row['Population'] == "Sample":
+        plt.text(row['PC1']+0.002, row['PC2']+0.002, row['IID'], fontsize=9)
+
+plt.title(f'PCA: {sample_id} r2={r2}')
+plt.grid(True, alpha=0.3)
+plt.savefig(out_png)
+PY
+    """
+}
+
+process RUN_ADMIXTURE_R2 {
+    publishDir "${params.outdir}/r2_sweep/admixture", mode: 'copy'
+    tag { "${sample_id}_r2_${r2}" }
+
+    input:
+    tuple val(sample_id), val(r2), path(bed), path(bim), path(fam)
+
+    output:
+    tuple val(sample_id), val(r2),
+          path("${sample_id}_r2_${r2}.Q"),
+          path("${sample_id}_r2_${r2}.P"),
+          path(fam),
+          path("${sample_id}_r2_${r2}_admixture.log")
+
+    script:
+    """
+    set -euo pipefail
+    export OMP_NUM_THREADS=${task.cpus}
+    admixture_bin=${params.admixture}
+    \$admixture_bin -j${task.cpus} --seed=${params.seed} --cv ${bed} ${params.k} \\
+        | tee ${sample_id}_r2_${r2}_admixture.log
+    mv ${bed.baseName}.${params.k}.Q ${sample_id}_r2_${r2}.Q
+    mv ${bed.baseName}.${params.k}.P ${sample_id}_r2_${r2}.P
     """
 }
 
