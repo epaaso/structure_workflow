@@ -1,7 +1,7 @@
 .nextflow/
 .nextflow.log*
 work/
-results/
+results*
 __pycache__/
 .DS_Store
 .vscode/

@@ -9,3 +9,6 @@ dependencies:
   - seaborn
   - structure
   - plink
+  - bwa
+  - samtools
+  - bcftools

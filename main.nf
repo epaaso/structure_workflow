@@ -26,6 +26,23 @@ params.r2_pca_components = 10
 params.seed      = 42
 params.panel_url = "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/integrated_call_samples_v3.20130502.ALL.panel"
 params.vcf_base_url = "https://hgdownload.soe.ucsc.edu/gbdb/hg38/1000Genomes"
+params.ref_mxl = null
+params.ref_eur = null
+params.ref_afr = null
+params.ref_limit = 40
+params.ref_mxl_pop = "MXL"
+params.ref_eur_super = "EUR"
+params.ref_afr_super = "AFR"
+params.ref_afr_pop = null
+params.build_ref_vcfs = false
+params.fastq_dir = "/datos/migccl/ancestry_refs"
+params.fastq_manifest = null
+params.fastq_pattern = "*_{1,2}.fastq.gz"
+params.ref_fasta = null
+params.ref_fasta_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
+params.bwa = "bwa"
+params.samtools = "samtools"
+params.bcftools = "bcftools"
 params.plink2    = "plink2"
 params.plink     = "/home/epaaso/bin/plink"
 params.admixture = "admixture"
@@ -67,122 +84,159 @@ workflow {
     def plink_pca
     def method = (params.method ?: "admixture").toString().toLowerCase()
 
-    // 1. Download Panel and Create Sample Lists
-    DOWNLOAD_PANEL()
-    CREATE_REF_LISTS(DOWNLOAD_PANEL.out)
-    
-    // Split outputs
-    CREATE_REF_LISTS.out
-        .map { mxl, eur, afr, all -> tuple(mxl, eur, afr) }
-        .set { ref_lists_separate }
-        
-    CREATE_REF_LISTS.out
-        .map { mxl, eur, afr, all -> all }
-        .set { ref_list_all }
+    def build_vcfs = params.build_ref_vcfs && params.build_ref_vcfs.toString().toLowerCase() != "false"
 
-    // 2. Download 1KG VCFs per chromosome
-    Channel.from(chroms).set { chrom_ch }
-    DOWNLOAD_1KG_VCF(chrom_ch)
-
-    // 3. Subset VCFs for all reference samples
-    DOWNLOAD_1KG_VCF.out
-        .combine(ref_list_all)
-        .set { subset_requests }
-
-    SUBSET_REF_VCF(subset_requests)
-    // Output: tuple(chrom, vcf, tbi)
-
-    FILTER_REF_CHROM(SUBSET_REF_VCF.out, file(params.exome_bed))
-
-    // Sample VCFs
-    Channel
-        .fromPath(params.input, checkIfExists: true)
-        .map { vcf ->
-            def id = vcf.name.replaceAll(/\.vcf(\.gz|\.bgz)?$/, "")
-            tuple(id, vcf)
-        }
-        .set { samples }
-
-    INDEX_SAMPLE(samples)
-    
-    // Collect sample artifacts for joint reference merge
-    INDEX_SAMPLE.out
-        .map { id, vcf, tbi -> [ vcf, tbi ] }
-        .collect()
-        .map { items ->
-            def files = (items && items[0] instanceof List) ? items.collectMany { it } : items
-            [ files as List ]
-        }
-        .set { all_sample_files }
-
-    // Merge all samples with ref per chromosome
-    FILTER_REF_CHROM.out
-        .combine(all_sample_files)
-        .set { merge_all_requests }
-
-    MERGE_ALL_SAMPLES_CHROM(merge_all_requests)
-    
-    MERGE_ALL_SAMPLES_CHROM.out
-        .map { vcf, tbi -> vcf }
-        .collect()
-        .set { all_merged_chrom_vcfs }
-
-    CONCAT_ALL_SAMPLES(all_merged_chrom_vcfs)
-    .set { merged_all }
-    
-    def plink_all = PREPARE_PLINK(merged_all)
-    plink_ready = plink_all.pruned
-    plink_pca = plink_all.pruned
-
-    if (params.r2_sweep) {
-        def r2_values = parseR2List(params.r2_values)
-        if (!r2_values) {
-            error "r2_sweep enabled but r2_values is empty; provide --r2_values \"0.01,0.02,...\""
+    if (build_vcfs) {
+        if (!(params.ref_fasta || params.ref_fasta_url)) {
+            error "build_ref_vcfs enabled but no --ref_fasta or --ref_fasta_url provided."
         }
 
-        plink_all.dedup
-            .flatMap { sample_id, bed, bim, fam ->
-                r2_values.collect { r2 -> tuple(sample_id, bed, bim, fam, r2) }
+        def ref_fasta_bundle = PREPARE_REF_FASTA()
+        def fastq_pairs
+        if (params.fastq_manifest) {
+            fastq_pairs = Channel
+                .fromPath(params.fastq_manifest, checkIfExists: true)
+                .splitCsv(header: false, sep: '\t')
+                .map { row ->
+                    if (row.size() < 3) {
+                        error "fastq_manifest requires 3 columns: sample_id<TAB>read1<TAB>read2"
+                    }
+                    tuple(row[0].toString(), [file(row[1].toString()), file(row[2].toString())])
+                }
+        } else {
+            def fastq_glob = "${params.fastq_dir}/**/fastq/${params.fastq_pattern}"
+            fastq_pairs = Channel.fromFilePairs(fastq_glob, flat: false, checkIfExists: true)
+        }
+
+        FASTQ_TO_VCF(fastq_pairs, ref_fasta_bundle)
+    } else {
+        // Sample VCFs
+        Channel
+            .fromPath(params.input, checkIfExists: true)
+            .map { vcf ->
+                def id = vcf.name.replaceAll(/\.vcf(\.gz|\.bgz)?$/, "")
+                tuple(id, vcf)
             }
-            .set { r2_sweep_inputs }
+            .set { samples }
 
-        def r2_sweep = LD_PRUNE_R2_SWEEP(r2_sweep_inputs)
-        def r2_pruned_sets = r2_sweep.pruned
+        // 1. Download Panel and Create Sample Lists
+        def ref_lists_full
+        if (params.ref_mxl || params.ref_eur || params.ref_afr) {
+            if (!(params.ref_mxl && params.ref_eur && params.ref_afr)) {
+                error "Provide --ref_mxl, --ref_eur, and --ref_afr together."
+            }
+            ref_lists_full = COMBINE_REF_LISTS(Channel.of(tuple(file(params.ref_mxl), file(params.ref_eur), file(params.ref_afr))))
+        } else {
+            def panel = DOWNLOAD_PANEL()
+            ref_lists_full = CREATE_REF_LISTS(panel)
+        }
 
-        RUN_PCA_R2(r2_pruned_sets)
-            .set { r2_pca_outputs }
+        // Split outputs
+        ref_lists_full
+            .map { mxl, eur, afr, all -> tuple(mxl, eur, afr) }
+            .set { ref_lists_separate }
+            
+        ref_lists_full
+            .map { mxl, eur, afr, all -> all }
+            .set { ref_list_all }
 
-        PLOT_PCA_R2(r2_pca_outputs, ref_lists_separate)
+        // 2. Download 1KG VCFs per chromosome
+        Channel.from(chroms).set { chrom_ch }
+        DOWNLOAD_1KG_VCF(chrom_ch)
 
-        RUN_ADMIXTURE_R2(r2_pruned_sets)
-    }
+        // 3. Subset VCFs for all reference samples
+        DOWNLOAD_1KG_VCF.out
+            .combine(ref_list_all)
+            .set { subset_requests }
 
-    if (method == "structure") {
-        CONVERT_TO_STRUCTURE_ALL(plink_pca, ref_lists_separate)
-        RUN_STRUCTURE_ALL(CONVERT_TO_STRUCTURE_ALL.out)
-        SUMMARIZE_STRUCTURE_ALL(RUN_STRUCTURE_ALL.out, ref_lists_separate)
-        SUMMARIZE_STRUCTURE_ALL.out
+        SUBSET_REF_VCF(subset_requests)
+        // Output: tuple(chrom, vcf, tbi)
+
+        FILTER_REF_CHROM(SUBSET_REF_VCF.out, file(params.exome_bed))
+
+        // Sample VCFs
+        INDEX_SAMPLE(samples)
+        
+        // Collect sample artifacts for joint reference merge
+        INDEX_SAMPLE.out
+            .map { id, vcf, tbi -> [ vcf, tbi ] }
+            .collect()
+            .map { items ->
+                def files = (items && items[0] instanceof List) ? items.collectMany { it } : items
+                [ files as List ]
+            }
+            .set { all_sample_files }
+
+        // Merge all samples with ref per chromosome
+        FILTER_REF_CHROM.out
+            .combine(all_sample_files)
+            .set { merge_all_requests }
+
+        MERGE_ALL_SAMPLES_CHROM(merge_all_requests)
+        
+        MERGE_ALL_SAMPLES_CHROM.out
+            .map { vcf, tbi -> vcf }
+            .collect()
+            .set { all_merged_chrom_vcfs }
+
+        CONCAT_ALL_SAMPLES(all_merged_chrom_vcfs)
+        .set { merged_all }
+        
+        def plink_all = PREPARE_PLINK(merged_all)
+        plink_ready = plink_all.pruned
+        plink_pca = plink_all.pruned
+
+        if (params.r2_sweep) {
+            def r2_values = parseR2List(params.r2_values)
+            if (!r2_values) {
+                error "r2_sweep enabled but r2_values is empty; provide --r2_values \"0.01,0.02,...\""
+            }
+
+            plink_all.dedup
+                .flatMap { sample_id, bed, bim, fam ->
+                    r2_values.collect { r2 -> tuple(sample_id, bed, bim, fam, r2) }
+                }
+                .set { r2_sweep_inputs }
+
+            def r2_sweep = LD_PRUNE_R2_SWEEP(r2_sweep_inputs)
+            def r2_pruned_sets = r2_sweep.pruned
+
+            RUN_PCA_R2(r2_pruned_sets)
+                .set { r2_pca_outputs }
+
+            PLOT_PCA_R2(r2_pca_outputs, ref_lists_separate)
+
+            RUN_ADMIXTURE_R2(r2_pruned_sets)
+        }
+
+        if (method == "structure") {
+            CONVERT_TO_STRUCTURE_ALL(plink_pca, ref_lists_separate)
+            RUN_STRUCTURE_ALL(CONVERT_TO_STRUCTURE_ALL.out)
+            SUMMARIZE_STRUCTURE_ALL(RUN_STRUCTURE_ALL.out, ref_lists_separate)
+            SUMMARIZE_STRUCTURE_ALL.out
+                .map { id, tsv -> tsv }
+                .collect()
+                .set { structure_ancestry_files }
+
+            PLOT_ANCESTRY(method, structure_ancestry_files, ref_lists_separate)
+        } else {
+            RUN_ADMIXTURE(plink_ready)
+            .set { admixture_outputs }
+
+            SUMMARIZE_Q(admixture_outputs, ref_lists_separate)
             .map { id, tsv -> tsv }
             .collect()
-            .set { structure_ancestry_files }
-
-        PLOT_ANCESTRY(method, structure_ancestry_files, ref_lists_separate)
-    } else {
-        RUN_ADMIXTURE(plink_ready)
-        .set { admixture_outputs }
-
-        SUMMARIZE_Q(admixture_outputs, ref_lists_separate)
-        .map { id, tsv -> tsv }
-        .collect()
-        .set { all_tsvs }
+            .set { all_tsvs }
+            
+            PLOT_ANCESTRY(method, all_tsvs, ref_lists_separate)
+        }
         
-        PLOT_ANCESTRY(method, all_tsvs, ref_lists_separate)
+        RUN_PCA_ALL(plink_pca)
+        .set { pca_results }
+        
+        PLOT_PCA_ALL(pca_results, ref_lists_separate)
     }
-    
-    RUN_PCA_ALL(plink_pca)
-    .set { pca_results }
-    
-    PLOT_PCA_ALL(pca_results, ref_lists_separate)
+
 }
 
 process MERGE_ALL_SAMPLES_CHROM {
@@ -1175,6 +1229,80 @@ PY
     """
 }
 
+// Prepare reference FASTA for alignment/variant calling
+process PREPARE_REF_FASTA {
+    publishDir "${params.outdir}/reference/genome", mode: 'copy'
+    conda 'environment.yml'
+
+    output:
+    tuple path("ref.fa"),
+          path("ref.fa.fai"),
+          path("ref.fa.bwt"),
+          path("ref.fa.ann"),
+          path("ref.fa.pac"),
+          path("ref.fa.amb"),
+          path("ref.fa.sa")
+
+    script:
+    """
+    set -euo pipefail
+    cache_dir="${params.outdir}/reference/genome"
+    if [ -s "\$cache_dir/ref.fa" ] && [ -s "\$cache_dir/ref.fa.bwt" ] && [ -s "\$cache_dir/ref.fa.fai" ]; then
+        cp "\$cache_dir/ref.fa" ref.fa
+        cp "\$cache_dir/ref.fa.bwt" ref.fa.bwt
+        cp "\$cache_dir/ref.fa.ann" ref.fa.ann
+        cp "\$cache_dir/ref.fa.pac" ref.fa.pac
+        cp "\$cache_dir/ref.fa.amb" ref.fa.amb
+        cp "\$cache_dir/ref.fa.sa" ref.fa.sa
+        cp "\$cache_dir/ref.fa.fai" ref.fa.fai
+        exit 0
+    fi
+
+    ref_src="${params.ref_fasta}"
+    if [ -n "\$ref_src" ] && [ "\$ref_src" != "null" ]; then
+        if [[ "\$ref_src" == *.gz ]]; then
+            gunzip -c "\$ref_src" > ref.fa
+        else
+            cp "\$ref_src" ref.fa
+        fi
+    else
+        wget -O ref.fa.gz "${params.ref_fasta_url}"
+        gunzip -c ref.fa.gz > ref.fa
+    fi
+
+    ${params.bwa} index ref.fa
+    ${params.samtools} faidx ref.fa
+    """
+}
+
+// Convert paired-end FASTQs to per-sample VCFs
+process FASTQ_TO_VCF {
+    publishDir "${params.outdir}/reference/fastq_vcfs", mode: 'copy'
+    tag { sample_id }
+    conda 'environment.yml'
+
+    input:
+    tuple val(sample_id), path(reads)
+    tuple path(ref_fa), path(ref_fai), path(ref_bwt), path(ref_ann), path(ref_pac), path(ref_amb), path(ref_sa)
+
+    output:
+    tuple val(sample_id), path("${sample_id}.vcf.gz"), path("${sample_id}.vcf.gz.tbi")
+
+    script:
+    """
+    set -euo pipefail
+    r1=${reads[0]}
+    r2=${reads[1]}
+
+    ${params.bwa} mem -t ${task.cpus} ${ref_fa} \$r1 \$r2 | ${params.samtools} sort -@ ${task.cpus} -o ${sample_id}.bam
+    ${params.samtools} index ${sample_id}.bam
+
+    ${params.bcftools} mpileup -f ${ref_fa} -Ou -a DP,AD ${sample_id}.bam \\
+        | ${params.bcftools} call -mv -Oz -o ${sample_id}.vcf.gz
+    ${params.bcftools} index -t ${sample_id}.vcf.gz
+    """
+}
+
 // Download the 1000 Genomes panel file
 process DOWNLOAD_PANEL {
     publishDir "${params.outdir}/reference/meta", mode: 'copy'
@@ -1202,17 +1330,50 @@ process CREATE_REF_LISTS {
     script:
     """
     set -euo pipefail
-    
-    # MXL
-    awk 'BEGIN{FS="\\t"; c=0} \$2=="MXL" {print \$1; c++; if(c==40) exit}' ${panel} > mxl_40.samples
-    
+
+    ref_limit="${params.ref_limit}"
+    if [ -z "\$ref_limit" ] || [ "\$ref_limit" = "null" ]; then
+        ref_limit=40
+    fi
+    if [ "\$ref_limit" = "all" ] || [ "\$ref_limit" = "0" ]; then
+        ref_limit=0
+    fi
+
+    mxl_pop="${params.ref_mxl_pop}"
+    eur_super="${params.ref_eur_super}"
+    afr_super="${params.ref_afr_super}"
+    afr_pop="${params.ref_afr_pop ?: ''}"
+
+    # MXL (Population)
+    awk -v pop="\$mxl_pop" -v max="\$ref_limit" 'BEGIN{FS="\\t"; c=0} \$2==pop {print \$1; c++; if(max>0 && c==max) exit}' ${panel} > mxl_40.samples
+
     # EUR (Super-pop)
-    awk 'BEGIN{FS="\\t"; c=0} \$3=="EUR" {print \$1; c++; if(c==40) exit}' ${panel} > eur_40.samples
-    
-    # AFR (Super-pop)
-    awk 'BEGIN{FS="\\t"; c=0} \$3=="AFR" {print \$1; c++; if(c==40) exit}' ${panel} > afr_40.samples
-    
+    awk -v super="\$eur_super" -v max="\$ref_limit" 'BEGIN{FS="\\t"; c=0} \$3==super {print \$1; c++; if(max>0 && c==max) exit}' ${panel} > eur_40.samples
+
+    # AFR (Super-pop or specific pop if provided)
+    if [ -n "\$afr_pop" ] && [ "\$afr_pop" != "null" ]; then
+        awk -v pop="\$afr_pop" -v max="\$ref_limit" 'BEGIN{FS="\\t"; c=0} \$2==pop {print \$1; c++; if(max>0 && c==max) exit}' ${panel} > afr_40.samples
+    else
+        awk -v super="\$afr_super" -v max="\$ref_limit" 'BEGIN{FS="\\t"; c=0} \$3==super {print \$1; c++; if(max>0 && c==max) exit}' ${panel} > afr_40.samples
+    fi
+
     cat mxl_40.samples eur_40.samples afr_40.samples > all_ref.samples
+    """
+}
+
+process COMBINE_REF_LISTS {
+    publishDir "${params.outdir}/reference/meta", mode: 'copy'
+
+    input:
+    tuple path(mxl_list), path(eur_list), path(afr_list)
+
+    output:
+    tuple path(mxl_list), path(eur_list), path(afr_list), path("all_ref.samples")
+
+    script:
+    """
+    set -euo pipefail
+    cat ${mxl_list} ${eur_list} ${afr_list} > all_ref.samples
     """
 }
 
@@ -1257,7 +1418,8 @@ process SUBSET_REF_VCF {
     set -euo pipefail
     c=\$(echo ${chrom} | sed 's/^chr//')
     
-    bcftools view --threads ${task.cpus} -S ${ref_list} -Oz -o ref_${chrom}.vcf.gz ${vcf}
+    # Some panel IDs are not present in the hg38 VCFs; ignore missing samples.
+    bcftools view --threads ${task.cpus} --force-samples -S ${ref_list} -Oz -o ref_${chrom}.vcf.gz ${vcf}
     bcftools index -t ref_${chrom}.vcf.gz
     """
 }
