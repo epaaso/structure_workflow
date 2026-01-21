@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  download_hgdp_fastqs.sh --samples <samples.txt> --outdir <dir> [--download] [--jobs N]
+  download_hgdp_fastqs.sh --samples <samples.txt> --outdir <dir> [--download] [--jobs N] [--quick-check] [--use-existing-urls]
 
 What it does:
   - For each HGDP sample ID (e.g. HGDP00455), queries ENA for read runs with sample_alias="HGDP00455".
@@ -15,6 +15,8 @@ What it does:
 Notes:
   - This downloads raw FASTQ and can be very large.
   - Requires: curl, awk, sort, xargs, gzip.
+  - --quick-check only verifies the gzip header is present (very fast, least strict).
+  - --use-existing-urls skips ENA queries and uses <outdir>/meta/fastq_urls.txt.
 
 Examples:
   # list URLs only
@@ -29,6 +31,8 @@ SAMPLES=""
 OUTDIR=""
 DO_DOWNLOAD=0
 JOBS=4
+QUICK_CHECK=0
+USE_EXISTING_URLS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       DO_DOWNLOAD=1; shift;;
     --jobs)
       JOBS="$2"; shift 2;;
+    --quick-check)
+      QUICK_CHECK=1; shift;;
+    --use-existing-urls)
+      USE_EXISTING_URLS=1; shift;;
     -h|--help)
       usage; exit 0;;
     *)
@@ -68,6 +76,15 @@ MANIFEST_OUT="$OUTDIR/meta/fastq_manifest.tsv"
 : > "$URLS_TMP"
 : > "$MANIFEST_OUT"
 
+is_gzip_ok() {
+  local f="$1"
+  if [[ "$QUICK_CHECK" -eq 1 ]]; then
+    head -c 2 "$f" | od -An -t x1 | tr -d ' \n' | grep -qi '^1f8b'
+  else
+    gzip -t "$f" >/dev/null 2>&1
+  fi
+}
+
 ena_query() {
   local sample="$1"
   # ENA API: TSV with fields (run_accession, fastq_ftp). fastq_ftp is semi-colon separated.
@@ -75,6 +92,12 @@ ena_query() {
   curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=sample_alias%3D%22${sample}%22&fields=run_accession,fastq_ftp&format=tsv&limit=0"
 }
 
+if [[ "$USE_EXISTING_URLS" -eq 1 ]]; then
+  if [[ ! -f "$URLS_OUT" ]]; then
+    echo "URL list not found: $URLS_OUT (disable --use-existing-urls to regenerate)" >&2
+    exit 2
+  fi
+else
 while IFS= read -r sample; do
   sample="${sample//$'\r'/}"
   [[ -z "$sample" ]] && continue
@@ -104,6 +127,7 @@ done < "$SAMPLES"
 # Deduplicate URLs
 sort -u "$URLS_TMP" > "$URLS_OUT"
 rm -f "$URLS_TMP"
+fi
 
 echo "Wrote URL list: $URLS_OUT" >&2
 echo "Wrote manifest: $MANIFEST_OUT" >&2
@@ -114,9 +138,28 @@ if [[ "$DO_DOWNLOAD" -eq 0 ]]; then
   exit 0
 fi
 
+URLS_DL="$OUTDIR/meta/fastq_urls.to_download.txt"
+: > "$URLS_DL"
+
+while IFS= read -r url; do
+  [[ -z "$url" ]] && continue
+  f="$(basename "$url")"
+  dest="$OUTDIR/fastq/$f"
+  if [[ -f "$dest" ]] && is_gzip_ok "$dest"; then
+    echo "[SKIP] $f (already downloaded)" >&2
+    continue
+  fi
+  echo "$url" >> "$URLS_DL"
+done < "$URLS_OUT"
+
+if [[ ! -s "$URLS_DL" ]]; then
+  echo "All FASTQ files already present and valid." >&2
+  exit 0
+fi
+
 # Download all URLs into OUTDIR/fastq (keep basename)
 # Use curl resume (-C -) and follow redirects (-L). Parallelize with xargs.
-cat "$URLS_OUT" \
-  | xargs -P "$JOBS" -I {} bash -lc 'u="$1"; outdir="$2"; f="$(basename "$u")"; dest="$outdir/fastq/$f"; if [[ -f "$dest" ]]; then if gzip -t "$dest" >/dev/null 2>&1; then echo "[SKIP] $f (ok)" >&2; exit 0; else echo "[RESUME] $f (corrupt or incomplete)" >&2; if ! curl -fL -C - -o "$dest" "$u"; then echo "[REDOWNLOAD] $f (resume failed)" >&2; rm -f "$dest"; fi; if [[ -f "$dest" ]] && gzip -t "$dest" >/dev/null 2>&1; then echo "[OK] $f" >&2; exit 0; else echo "[REDOWNLOAD] $f (still corrupt)" >&2; rm -f "$dest"; fi; fi; fi; echo "[DL] $f" >&2; curl -fL -o "$dest" "$u"' _ {} "$OUTDIR"
+cat "$URLS_DL" \
+  | xargs -P "$JOBS" -I {} bash -lc 'set -euo pipefail; u="$1"; outdir="$2"; f="$(basename "$u")"; dest="$outdir/fastq/$f"; quick="$3"; is_gzip_ok() { if [[ "$quick" -eq 1 ]]; then head -c 2 "$dest" | od -An -t x1 | tr -d " \\n" | grep -qi "^1f8b"; else gzip -t "$dest" >/dev/null 2>&1; fi; }; if [[ -f "$dest" ]]; then echo "[RESUME] $f" >&2; else echo "[DL] $f" >&2; fi; if ! curl -fL -C - -o "$dest" "$u"; then echo "[REDOWNLOAD] $f (resume failed)" >&2; rm -f "$dest"; curl -fL -o "$dest" "$u"; fi; if ! is_gzip_ok; then echo "[REDOWNLOAD] $f (corrupt after download)" >&2; rm -f "$dest"; curl -fL -o "$dest" "$u"; is_gzip_ok; fi' _ {} "$OUTDIR" "$QUICK_CHECK"
 
 echo "Done. Files in: $OUTDIR/fastq" >&2
