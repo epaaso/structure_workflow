@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  download_hgdp_fastqs.sh --samples <samples.txt> --outdir <dir> [--download] [--jobs N] [--quick-check] [--use-existing-urls]
+  download_hgdp_fastqs.sh --samples <samples.txt> --outdir <dir> [--download] [--jobs N] [--quick-check] [--use-existing-urls] [--ftp]
 
 What it does:
   - For each HGDP sample ID (e.g. HGDP00455), queries ENA for read runs with sample_alias="HGDP00455".
@@ -14,9 +14,10 @@ What it does:
 
 Notes:
   - This downloads raw FASTQ and can be very large.
-  - Requires: curl, awk, sort, xargs, gzip.
+  - Requires: curl, awk, sort, xargs, gzip. (lftp if --ftp is used)
   - --quick-check only verifies the gzip header is present (very fast, least strict).
   - --use-existing-urls skips ENA queries and uses <outdir>/meta/fastq_urls.txt.
+  - --ftp uses lftp (pget) instead of curl for downloading.
 
 Examples:
   # list URLs only
@@ -33,6 +34,7 @@ DO_DOWNLOAD=0
 JOBS=4
 QUICK_CHECK=0
 USE_EXISTING_URLS=0
+USE_FTP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,6 +50,8 @@ while [[ $# -gt 0 ]]; do
       QUICK_CHECK=1; shift;;
     --use-existing-urls)
       USE_EXISTING_URLS=1; shift;;
+    --ftp)
+      USE_FTP=1; shift;;
     -h|--help)
       usage; exit 0;;
     *)
@@ -73,8 +77,6 @@ mkdir -p "$OUTDIR" "$OUTDIR/fastq" "$OUTDIR/meta"
 URLS_TMP="$OUTDIR/meta/fastq_urls.tmp.txt"
 URLS_OUT="$OUTDIR/meta/fastq_urls.txt"
 MANIFEST_OUT="$OUTDIR/meta/fastq_manifest.tsv"
-: > "$URLS_TMP"
-: > "$MANIFEST_OUT"
 
 is_gzip_ok() {
   local f="$1"
@@ -98,7 +100,9 @@ if [[ "$USE_EXISTING_URLS" -eq 1 ]]; then
     exit 2
   fi
 else
-while IFS= read -r sample; do
+  : > "$URLS_TMP"
+  : > "$MANIFEST_OUT"
+  while IFS= read -r sample; do
   sample="${sample//$'\r'/}"
   [[ -z "$sample" ]] && continue
 
@@ -160,6 +164,6 @@ fi
 # Download all URLs into OUTDIR/fastq (keep basename)
 # Use curl resume (-C -) and follow redirects (-L). Parallelize with xargs.
 cat "$URLS_DL" \
-  | xargs -P "$JOBS" -I {} bash -lc 'set -euo pipefail; u="$1"; outdir="$2"; f="$(basename "$u")"; dest="$outdir/fastq/$f"; quick="$3"; is_gzip_ok() { if [[ "$quick" -eq 1 ]]; then head -c 2 "$dest" | od -An -t x1 | tr -d " \\n" | grep -qi "^1f8b"; else gzip -t "$dest" >/dev/null 2>&1; fi; }; if [[ -f "$dest" ]]; then echo "[RESUME] $f" >&2; else echo "[DL] $f" >&2; fi; if ! curl -fL -C - -o "$dest" "$u"; then echo "[REDOWNLOAD] $f (resume failed)" >&2; rm -f "$dest"; curl -fL -o "$dest" "$u"; fi; if ! is_gzip_ok; then echo "[REDOWNLOAD] $f (corrupt after download)" >&2; rm -f "$dest"; curl -fL -o "$dest" "$u"; is_gzip_ok; fi' _ {} "$OUTDIR" "$QUICK_CHECK"
+  | xargs -P "$JOBS" -I {} bash -lc 'set -euo pipefail; u="$1"; outdir="$2"; f="$(basename "$u")"; dest="$outdir/fastq/$f"; quick="$3"; use_ftp="$4"; is_gzip_ok() { if [[ "$quick" -eq 1 ]]; then head -c 2 "$dest" | od -An -t x1 | tr -d " \\n" | grep -qi "^1f8b"; else gzip -t "$dest" >/dev/null 2>&1; fi; }; do_dl_resume() { if [[ "$use_ftp" -eq 1 ]]; then lftp -c "pget -n 4 -c \"$u\" -o \"$dest\""; else curl -fL -C - -o "$dest" "$u"; fi; }; do_dl_fresh() { rm -f "$dest"; if [[ "$use_ftp" -eq 1 ]]; then lftp -c "pget -n 4 -c \"$u\" -o \"$dest\""; else curl -fL -o "$dest" "$u"; fi; }; if [[ -f "$dest" ]]; then echo "[RESUME] $f" >&2; else echo "[DL] $f" >&2; fi; if ! do_dl_resume; then echo "[REDOWNLOAD] $f (resume failed)" >&2; do_dl_fresh; fi; if ! is_gzip_ok; then echo "[REDOWNLOAD] $f (corrupt after download)" >&2; do_dl_fresh; is_gzip_ok; fi' _ {} "$OUTDIR" "$QUICK_CHECK" "$USE_FTP"
 
 echo "Done. Files in: $OUTDIR/fastq" >&2
