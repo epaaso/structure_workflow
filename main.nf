@@ -696,6 +696,7 @@ PY
 
 // Filter reference VCF to exome regions before concatenation
 process FILTER_REF_CHROM {
+    publishDir "${params.outdir}/reference/filtered_vcfs", mode: 'copy'
     tag { chrom }
 
     input:
@@ -708,6 +709,20 @@ process FILTER_REF_CHROM {
     script:
     """
     set -euo pipefail
+
+    outdir="${params.outdir}"
+    if [[ "\$outdir" != /* ]]; then
+        outdir="${workflow.launchDir}/${params.outdir}"
+    fi
+    cache_dir="\${outdir}/reference/filtered_vcfs"
+    cached_vcf="\${cache_dir}/ref_exome_${chrom}.vcf.gz"
+    cached_tbi="\${cache_dir}/ref_exome_${chrom}.vcf.gz.tbi"
+
+    if [ -s "\$cached_vcf" ] && [ -s "\$cached_tbi" ]; then
+        cp "\$cached_vcf" "ref_exome_${chrom}.vcf.gz"
+        cp "\$cached_tbi" "ref_exome_${chrom}.vcf.gz.tbi"
+        exit 0
+    fi
     
     # Check VCF headers for chr style
     if bcftools view -h ${vcf} | grep -q "##contig=<ID=chr"; then
@@ -740,6 +755,17 @@ process INDEX_SAMPLE {
     script:
     """
     set -euo pipefail
+
+    outdir="${params.outdir}"
+    if [[ "\$outdir" != /* ]]; then
+        outdir="${workflow.launchDir}/${params.outdir}"
+    fi
+    cache_tbi="\${outdir}/samples/indexed/${sample_vcf.name}.tbi"
+    if [ -s "\$cache_tbi" ]; then
+        cp "\$cache_tbi" "${sample_vcf.name}.tbi"
+        exit 0
+    fi
+
     bcftools index -t -f ${sample_vcf}
     """
 }
@@ -1313,6 +1339,17 @@ process DOWNLOAD_PANEL {
     script:
     """
     set -euo pipefail
+
+    outdir="${params.outdir}"
+    if [[ "\$outdir" != /* ]]; then
+        outdir="${workflow.launchDir}/${params.outdir}"
+    fi
+    cached_panel="\${outdir}/reference/meta/integrated_call_samples_v3.20130502.ALL.panel"
+    if [ -s "\$cached_panel" ]; then
+        cp "\$cached_panel" integrated_call_samples_v3.20130502.ALL.panel
+        exit 0
+    fi
+
     wget -O integrated_call_samples_v3.20130502.ALL.panel "${params.panel_url}"
     """
 }
@@ -1393,6 +1430,19 @@ process DOWNLOAD_1KG_VCF {
     set -euo pipefail
     # Handle chr prefix if present in chrom val
     c=\$(echo ${chrom} | sed 's/^chr//')
+
+    outdir="${params.outdir}"
+    if [[ "\$outdir" != /* ]]; then
+        outdir="${workflow.launchDir}/${params.outdir}"
+    fi
+    cache_dir="\${outdir}/reference/raw_vcfs"
+    cached_vcf="\${cache_dir}/chr\${c}.1kg.vcf.gz"
+    cached_tbi="\${cache_dir}/chr\${c}.1kg.vcf.gz.tbi"
+    if [ -s "\$cached_vcf" ] && [ -s "\$cached_tbi" ]; then
+        cp "\$cached_vcf" "chr\${c}.1kg.vcf.gz"
+        cp "\$cached_tbi" "chr\${c}.1kg.vcf.gz.tbi"
+        exit 0
+    fi
     
     vcf_url="${params.vcf_base_url}/ALL.chr\${c}.shapeit2_integrated_snvindels_v2a_27022019.GRCh38.phased.vcf.gz"
     tbi_url="\${vcf_url}.tbi"
@@ -1417,6 +1467,19 @@ process SUBSET_REF_VCF {
     """
     set -euo pipefail
     c=\$(echo ${chrom} | sed 's/^chr//')
+
+    outdir="${params.outdir}"
+    if [[ "\$outdir" != /* ]]; then
+        outdir="${workflow.launchDir}/${params.outdir}"
+    fi
+    cache_dir="\${outdir}/reference/subset_vcfs"
+    cached_vcf="\${cache_dir}/ref_${chrom}.vcf.gz"
+    cached_tbi="\${cache_dir}/ref_${chrom}.vcf.gz.tbi"
+    if [ -s "\$cached_vcf" ] && [ -s "\$cached_tbi" ]; then
+        cp "\$cached_vcf" "ref_${chrom}.vcf.gz"
+        cp "\$cached_tbi" "ref_${chrom}.vcf.gz.tbi"
+        exit 0
+    fi
     
     # Some panel IDs are not present in the hg38 VCFs; ignore missing samples.
     bcftools view --threads ${task.cpus} --force-samples -S ${ref_list} -Oz -o ref_${chrom}.vcf.gz ${vcf}
