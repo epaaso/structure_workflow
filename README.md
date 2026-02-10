@@ -13,7 +13,6 @@ This Nextflow pipeline performs ancestry inference for VCF samples using 1000 Ge
 
 - [Nextflow](https://www.nextflow.io/)
 - [Conda](https://docs.conda.io/en/latest/) (recommended for dependency management)
-- `bwa`, `samtools`, and `bcftools` (only required if `--build_ref_vcfs` is enabled)
 
 Dependencies are defined in `environment.yml`.
 
@@ -55,15 +54,6 @@ nextflow run main.nf --input "path/to/your/vcfs/*.vcf.gz" --outdir results
 | `--ref_eur_super` | 1KG super-population used to select EUR references from the panel | `EUR` |
 | `--ref_afr_super` | 1KG super-population used to select AFR references from the panel (unless `--ref_afr_pop` is set) | `AFR` |
 | `--ref_afr_pop` | Specific AFR population to use (e.g., `YRI`); overrides `--ref_afr_super` | unset |
-| `--build_ref_vcfs` | Build per-sample VCFs from paired-end FASTQs (runs only the FASTQ→VCF routine) | `false` |
-| `--fastq_dir` | Base directory containing per-cohort `fastq/` folders | `/datos/migccl/ancestry_refs` |
-| `--fastq_pattern` | FASTQ glob pattern (relative to each `fastq/` folder) | `*_{1,2}.fastq.gz` |
-| `--fastq_manifest` | Optional manifest file (`sample_id<TAB>read1<TAB>read2`) | unset |
-| `--ref_fasta` | Path to hg38 FASTA (used for FASTQ conversion); if unset, download from `--ref_fasta_url` | unset |
-| `--ref_fasta_url` | hg38 FASTA URL (used when `--ref_fasta` is unset) | `https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz` |
-| `--bwa` | Path to `bwa` | `bwa` |
-| `--samtools` | Path to `samtools` | `samtools` |
-| `--bcftools` | Path to `bcftools` | `bcftools` |
 | `--plink2` | Path to `plink2` binary (used for VCF→PLINK conversion + QC + default pruning) | `plink2` |
 | `--plink` | Path to PLINK 1.9 binary (used for PCA, STRUCTURE conversion, and r² sweep pruning) | `/home/epaaso/bin/plink` |
 | `--admixture` | Path to `admixture` binary | `admixture` |
@@ -84,7 +74,6 @@ The pipeline produces results in the specified output directory (default: `resul
 - **merged_all/**: Merged VCF/PLINK datasets of samples and reference.
 - **pca/**: PCA results (eigenvectors, eigenvalues).
 - **r2_sweep/**: LD r² sweep outputs (pruned sets, PCA, ADMIXTURE CV logs).
-- **reference/fastq_vcfs/**: Per-sample VCFs generated from FASTQs (when `--build_ref_vcfs` is enabled).
 
 ## Directory Structure
 
@@ -94,41 +83,6 @@ The pipeline produces results in the specified output directory (default: `resul
 - `bin/`: Contains executable scripts or binaries (e.g., `structure`).
 
 ## Utilities
-
-### Optional: build reference VCFs from paired-end FASTQs
-
-If you have reference FASTQs (paired-end, `_1` / `_2` suffixes), you can generate per-sample VCFs. This mode only runs the FASTQ→VCF routine:
-
-```bash
-nextflow run main.nf \
-  --method admixture \
-  --build_ref_vcfs true \
-  --fastq_dir /datos/migccl/ancestry_refs \
-  --ref_fasta_url https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz \
-  --outdir results_fastq_refs
-```
-
-The FASTQ-derived VCFs land under `reference/fastq_vcfs/` inside your `--outdir`. Use those VCFs as input for the main pipeline in a separate run.
-If your files end in `.fq.gz`, set `--fastq_pattern "*_{1,2}.fq.gz"`.
-If `reference/genome/ref.fa` already exists in your `--outdir`, the workflow will reuse it and skip downloading/indexing.
-
-You can also provide a manifest (`sample_id<TAB>read1<TAB>read2`) to control sample IDs:
-
-```bash
-nextflow run main.nf \
-  --build_ref_vcfs true \
-  --fastq_manifest /path/to/fastq_manifest.tsv \
-  --ref_fasta /path/to/hg38.fa \
-  --outdir results_fastq_refs
-```
-
-Then run the main workflow using the generated VCFs:
-
-```bash
-nextflow run main.nf \
-  --input "results_fastq_refs/reference/fastq_vcfs/*.vcf.gz" \
-  --outdir results_from_fastqs
-```
 
 ### Check which AIM alleles are present in your samples
 
@@ -200,32 +154,25 @@ nohup nextflow run main.nf -resume --method admixture \
 	> results_pure
 ```
 
-### Download HGDP FASTQs (ENA/FTP)
+### FASTQ/VCF helper scripts
 
-To download raw HGDP FASTQ files for a list of HGDP sample IDs (e.g., `HGDP00455`) using ENA metadata (the `fastq_ftp` field), use `scripts/download_hgdp_fastqs.sh`.
+FASTQ download helpers and FASTQ->VCF conversion are maintained in `../nextflow_variant_calling/` now:
 
-Inputs:
+- `../nextflow_variant_calling/main.nf`
+- `../nextflow_variant_calling/scripts/download_hgdp_fastqs.sh`
+- `../nextflow_variant_calling/scripts/download_sra_fastqs.sh`
 
-- A sample list file with one HGDP ID per line (example: `inputs/biaka_hgdp.samples.txt`)
 
-This writes a deduplicated URL list and manifest under your output directory:
 
-- `<outdir>/meta/fastq_urls.txt`
-- `<outdir>/meta/fastq_manifest.tsv`
+The real solution:
+You need intersection of variants, not union. The pipeline currently takes all HGDP variants, but should only use variants that exist in both datasets.
 
-List URLs only (recommended first):
+Quick fix: Modify the merge to use only common variants:
 
-```bash
-./scripts/download_hgdp_fastqs.sh \
-	--samples inputs/biaka_hgdp.samples.txt \
-	--outdir /datos/migccl/ancestry_refs/BiakaHGDP
-```
 
-Download (large; uses resume, parallelizable):
+# In main.nf, around line 298, change the merge strategy
+# Instead of merging all sites, intersect them first
+bcftools isec -n=2 -w1 $REF_VCF <sample_vcfs> | bcftools merge ...
+Or better solution: Just use HGDP reference populations for all three ancestries. Do you have HGDP European and African samples? Let's check:
 
-```bash
-./scripts/download_hgdp_fastqs.sh \
-	--samples inputs/biaka_hgdp.samples.txt \
-	--outdir /datos/migccl/ancestry_refs/BiakaHGDP \
-	--download --jobs 4
-```
+
