@@ -44,6 +44,7 @@ params.max_memory = '120 GB'   // per-process max; overridden by --max_memory
 params.burnin    = 1000
 params.numreps   = 1000
 params.exome_bed = "${workflow.projectDir}/exome_hg38.bed"
+params.skip_download = false  // if true, require cached reference files and never call wget
 
 def parseChroms(value) {
     def tokens = value.toString().split(/[, ]+/).findAll { it }
@@ -233,37 +234,50 @@ process MERGE_ALL_SAMPLES_CHROM {
         REF_VCF="\$REF_IN"
     fi
     
-    # Determine which sites exist in *any* sample for this chromosome.
-    # We intentionally drop variants present only in the reference panel to avoid batch effects.
-    # The sample VCFs and their .tbi indices are staged via `sample_files`.
+    # Use INTERSECTION of variants (not union) to avoid batch effects when
+    # mixing samples from different platforms (e.g. HGDP + 1000 Genomes).
+    # Only variants present in BOTH the reference panel AND samples are kept.
     ls *.vcf.gz \\
       | grep -v '^ref_' \\
       | sort -V > sample_vcfs.list
-    
+
     if [ ! -s sample_vcfs.list ]; then
         echo "ERROR: No sample VCFs were staged for merge on ${chrom}" >&2
         ls -la >&2
         exit 1
     fi
 
-    # bcftools query cannot query multiple VCFs with different sample sets at once,
-    # so we query each sample VCF and take the union of positions.
+    # 1. Collect reference sites for this chromosome
+    bcftools query -f '%CHROM\\t%POS\\n' -r ${chrom} "\$REF_VCF" \\
+      | LC_ALL=C sort -u > ref_sites.tsv
+
+    # 2. Collect union of sample sites
     : > sample_sites.raw.tsv
     while read -r vcf; do
         bcftools query -f '%CHROM\\t%POS\\n' -r ${chrom} "\$vcf"
     done < sample_vcfs.list >> sample_sites.raw.tsv
-
-    sort -u -k1,1 -k2,2n sample_sites.raw.tsv > sample_sites.tsv
+    LC_ALL=C sort -u sample_sites.raw.tsv > sample_sites.tsv
     rm -f sample_sites.raw.tsv
 
-    # Merge
-    # We do NOT use --missing-to-ref to avoid batch effects.
-    # Missing data will be handled by downstream tools (Plink/Structure).
+    # 3. INTERSECT: keep only sites present in BOTH ref AND samples
+    LC_ALL=C comm -12 ref_sites.tsv sample_sites.tsv > isec_sites.tsv
+
+    n_ref=\$(wc -l < ref_sites.tsv)
+    n_sample=\$(wc -l < sample_sites.tsv)
+    n_isec=\$(wc -l < isec_sites.tsv)
+    echo "Sites on ${chrom}: ref=\$n_ref, samples(union)=\$n_sample, intersection=\$n_isec" >&2
+
+    if [ ! -s isec_sites.tsv ]; then
+        echo "ERROR: No intersecting sites between reference and samples on ${chrom}" >&2
+        exit 1
+    fi
+
+    # 4. Merge ref + samples
     bcftools merge --threads ${task.cpus} \$REF_VCF -l sample_vcfs.list -r ${chrom} -Oz -o merged_all_${chrom}.vcf.gz
     bcftools index -t -f merged_all_${chrom}.vcf.gz
 
-    # Drop reference-only sites (keep only sites observed in samples)
-    bcftools view --threads ${task.cpus} -T sample_sites.tsv merged_all_${chrom}.vcf.gz -Oz -o all_samples_ref_${chrom}.vcf.gz
+    # 5. Filter to intersection sites only
+    bcftools view --threads ${task.cpus} -T isec_sites.tsv merged_all_${chrom}.vcf.gz -Oz -o all_samples_ref_${chrom}.vcf.gz
     bcftools index -t -f all_samples_ref_${chrom}.vcf.gz
 
     rm -f merged_all_${chrom}.vcf.gz merged_all_${chrom}.vcf.gz.csi merged_all_${chrom}.vcf.gz.tbi
@@ -1239,6 +1253,10 @@ process DOWNLOAD_PANEL {
         cp "\$cached_panel" integrated_call_samples_v3.20130502.ALL.panel
         exit 0
     fi
+    if [ "${params.skip_download}" = "true" ]; then
+        echo "ERROR: --skip_download is true but cached panel not found at '\$cached_panel'" >&2
+        exit 1
+    fi
 
     wget -O integrated_call_samples_v3.20130502.ALL.panel "${params.panel_url}"
     """
@@ -1332,6 +1350,11 @@ process DOWNLOAD_1KG_VCF {
         cp "\$cached_vcf" "chr\${c}.1kg.vcf.gz"
         cp "\$cached_tbi" "chr\${c}.1kg.vcf.gz.tbi"
         exit 0
+    fi
+    if [ "${params.skip_download}" = "true" ]; then
+        echo "ERROR: --skip_download is true but cached files are missing for ${chrom} in '\$cache_dir'" >&2
+        echo "       Expected: '\$cached_vcf' and '\$cached_tbi'" >&2
+        exit 1
     fi
     
     vcf_url="${params.vcf_base_url}/ALL.chr\${c}.shapeit2_integrated_snvindels_v2a_27022019.GRCh38.phased.vcf.gz"
