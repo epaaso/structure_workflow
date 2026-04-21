@@ -12,6 +12,9 @@ params.input   = "vcfs/*.vcf.gz"
 params.outdir  = "results"
 params.chroms  = "1-22"      // comma list or ranges like 1-22 or chr1,chr2
 params.k       = 3           // number of ancestries
+params.extract_snps   = null           // File containing list of SNPs to keep (e.g., AIMs)
+params.exclude_snps   = null           // File containing list of SNPs to exclude
+params.exclude_regions = null          // BED file containing regions to exclude (e.g., leukemia genes)
 params.maf     = 0.05
 params.geno    = 0.05
 params.mind    = 0.8
@@ -328,13 +331,61 @@ process PREPARE_PLINK {
     plink=${params.plink2}
     mem_mb=${task.memory.toMega()}
 
+    extract_cmd=""
+    ${params.extract_snps ? """
+    extract_file="${params.extract_snps}"
+    if [[ "\$extract_file" != /* ]]; then
+        extract_file="${workflow.launchDir}/\$extract_file"
+    fi
+    if [[ "\$extract_file" == *.csv ]]; then
+        awk -F',' 'NR>1 {
+            if (\$1 != "" && \$1 != ".") print \$1;
+            if (\$2 != "" && \$3 != "") {
+                print \$2":"\$3;
+                print "chr"\$2":"\$3;
+            }
+        }' "\$extract_file" > extract_list.txt
+    else
+        cp "\$extract_file" extract_list.txt
+    fi
+    extract_cmd="--extract extract_list.txt"
+    """ : ""}
+
+    exclude_cmd=""
+    ${params.exclude_snps ? """
+    exclude_file="${params.exclude_snps}"
+    if [[ "\$exclude_file" != /* ]]; then
+        exclude_file="${workflow.launchDir}/\$exclude_file"
+    fi
+    if [[ "\$exclude_file" == *.csv ]]; then
+        awk -F',' 'NR>1 {print \$1}' "\$exclude_file" > exclude_list.txt
+    else
+        cp "\$exclude_file" exclude_list.txt
+    fi
+    exclude_cmd="--exclude exclude_list.txt"
+    """ : ""}
+
+    ${params.exclude_regions ? """
+    exclude_regions_file="${params.exclude_regions}"
+    if [[ "\$exclude_regions_file" != /* ]]; then
+        exclude_regions_file="${workflow.launchDir}/\$exclude_regions_file"
+    fi
+    cp "\$exclude_regions_file" exclude_regions.bed
+    exclude_cmd="\$exclude_cmd --exclude bed0 exclude_regions.bed"
+    """ : ""}
+
     # Sort variants first as requested by plink2 if chromosomes are split
     \$plink --threads ${task.cpus} --memory \$mem_mb --vcf ${merged_vcf} --chr ${params.chroms} --max-alleles 2 --make-pgen --sort-vars --out ${sample_id}_sorted
-    
+
     # Convert to BED and continue
-    \$plink --threads ${task.cpus} --memory \$mem_mb --pfile ${sample_id}_sorted --make-bed --out ${sample_id}_base
+    \$plink --threads ${task.cpus} --memory \$mem_mb --pfile ${sample_id}_sorted --set-missing-var-ids @:# \$extract_cmd \$exclude_cmd --make-bed --out ${sample_id}_base
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_base --snps-only just-acgt --max-alleles 2 --make-bed --out ${sample_id}_snps
-    \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_snps --maf ${params.maf} --geno ${params.geno} --mind ${params.mind} --make-bed --out ${sample_id}_clean
+    
+    # Identify and exclude ambiguous A/T and C/G SNPs to prevent strand flip issues
+    awk '(\$5=="A" && \$6=="T") || (\$5=="T" && \$6=="A") || (\$5=="C" && \$6=="G") || (\$5=="G" && \$6=="C") {print \$2}' ${sample_id}_snps.bim > ${sample_id}_ambiguous_snps.txt
+    \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_snps --exclude ${sample_id}_ambiguous_snps.txt --make-bed --out ${sample_id}_snps_unambig
+    
+    \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_snps_unambig --maf ${params.maf} --geno ${params.geno} --mind ${params.mind} --make-bed --out ${sample_id}_clean
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_clean --set-all-var-ids @:# --rm-dup exclude-all --make-bed --out ${sample_id}_dedup
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_dedup --indep-pairwise ${params.ld_window} ${params.ld_step} ${params.ld_r2} --bad-ld --out ${sample_id}_prune
     \$plink --threads ${task.cpus} --memory \$mem_mb --bfile ${sample_id}_dedup --extract ${sample_id}_prune.prune.in --make-bed --out ${sample_id}_pruned
